@@ -1,0 +1,4 @@
+pages:
+  script: ["true"]
+  artifacts:
+    paths: [public]

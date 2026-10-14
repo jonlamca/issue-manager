@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Issue Manager</title>
+<style>
+  :root { color-scheme: light dark; font: 14px system-ui, sans-serif; }
+  body { margin: 0; height: 100vh; display: flex; flex-direction: column; }
+  [hidden] { display: none !important; }
+  header { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 8px; border-bottom: 1px solid GrayText; }
+  #scope { width: 22em; max-width: 100%; }
+  #status { margin-left: auto; }
+  #board { flex: 1; min-height: 0; display: flex; gap: 8px; align-items: flex-start; padding: 8px; overflow-x: auto; }
+  .col { flex: 0 0 280px; max-height: 100%; overflow-y: auto; box-sizing: border-box; border: 1px solid GrayText; border-radius: 6px; padding: 6px; }
+  .col.over { outline: 2px solid Highlight; }
+  .col h2 { font-size: 14px; margin: 0 0 6px; }
+  .tools { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; }
+  .cards { display: flex; flex-direction: column; gap: 4px; min-height: 60px; }
+  .card { display: block; padding: 6px; border: 1px solid GrayText; border-radius: 4px; cursor: grab; }
+  .card:has(:checked) { outline: 2px solid Highlight; }
+  .meta { font-size: 12px; opacity: .7; }
+</style>
+<header>
+  <form id="pick">
+    <input id="scope" list="scopes" placeholder="group or group/project" aria-label="Group or project" required>
+    <datalist id="scopes"></datalist>
+    <button>Load</button>
+  </form>
+  <button id="newMs">+ Milestone</button>
+  <input id="filter" type="search" placeholder="Filter issues" aria-label="Filter issues">
+  <span id="status" role="status"></span>
+  <button id="signout">Sign out</button>
+</header>
+<main id="board"></main>
+<script>
+// Edit these two, then deploy.
+const GITLAB = 'https://gitlab.com';
+const CLIENT_ID = ''; // OAuth application ID (non-confidential, scope: api)
+
+const REDIRECT = location.origin + location.pathname;
+const $ = id => document.getElementById(id);
+const setStatus = t => $('status').textContent = t;
+const run = fn => async (...a) => { try { await fn(...a); } catch (e) { setStatus(e.message); } };
+const el = (tag, props = {}, ...kids) => { const e = Object.assign(document.createElement(tag), props); e.append(...kids); return e; };
+const b64url = buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const sha256 = s => crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+const kinds = new Map(); // full path -> 'groups' | 'projects'
+let cur; // { kind, base }
+
+// --- OAuth (authorization code + PKCE, no backend) ---
+async function login() {
+  const verifier = b64url(crypto.getRandomValues(new Uint8Array(32)));
+  const state = b64url(crypto.getRandomValues(new Uint8Array(16)));
+  sessionStorage.pkce = JSON.stringify({ verifier, state });
+  location = GITLAB + '/oauth/authorize?' + new URLSearchParams({
+    client_id: CLIENT_ID, redirect_uri: REDIRECT, response_type: 'code', scope: 'api', state,
+    code_challenge: b64url(await sha256(verifier)), code_challenge_method: 'S256',
+  });
+}
+
+async function token() {
+  const q = new URLSearchParams(location.search);
+  if (q.get('error')) throw Error(q.get('error_description') || q.get('error'));
+  if (q.has('code')) {
+    const { verifier, state } = JSON.parse(sessionStorage.pkce || '{}');
+    sessionStorage.removeItem('pkce');
+    history.replaceState(null, '', REDIRECT);
+    if (!state || q.get('state') !== state) throw Error('OAuth state mismatch, reload to retry');
+    const r = await fetch(GITLAB + '/oauth/token', { method: 'POST', body: new URLSearchParams({
+      client_id: CLIENT_ID, code: q.get('code'), grant_type: 'authorization_code', redirect_uri: REDIRECT, code_verifier: verifier,
+    }) });
+    if (!r.ok) throw Error('Token exchange failed: ' + r.status);
+    sessionStorage.token = (await r.json()).access_token;
+  }
+  return sessionStorage.token;
+}
+
+// ponytail: token expires after 2h and we just re-run SSO; use refresh_token if the redirect bothers you.
+async function api(path, opts = {}) {
+  const r = await fetch(GITLAB + '/api/v4' + path, { ...opts, headers: {
+    Authorization: 'Bearer ' + sessionStorage.token, ...(opts.body && { 'Content-Type': 'application/json' }),
+  } });
+  if (r.status === 401) { sessionStorage.removeItem('token'); login(); throw Error('Session expired, signing in…'); }
+  if (!r.ok) throw Error(`${r.status} ${(await r.json().catch(() => ({}))).message ?? path}`);
+  return r;
+}
+
+async function all(path) {
+  const out = [];
+  for (let page = '1'; page; ) {
+    const r = await api(`${path}${path.includes('?') ? '&' : '?'}per_page=100&page=${page}`);
+    out.push(...await r.json());
+    page = r.headers.get('x-next-page');
+  }
+  return out;
+}
+
+// --- Board: one column per milestone, drag issues between them ---
+const msPath = m => m.project_id ? `/projects/${m.project_id}/milestones/${m.id}` : `/groups/${m.group_id}/milestones/${m.id}`;
+const selected = () => [...$('board').querySelectorAll('.card input:checked')].map(i => i.closest('.card'));
+const recount = () => $('board').querySelectorAll('.col').forEach(c => c.querySelector('.n').textContent = c.querySelectorAll('.card:not([hidden])').length);
+
+function card(i) {
+  const c = el('label', { className: 'card', draggable: true, issue: i },
+    el('input', { type: 'checkbox' }), ' ',
+    el('a', { href: i.web_url, target: '_blank', rel: 'noopener' }, i.references.relative), ' ', i.title,
+    el('div', { className: 'meta' }, [...i.labels, ...i.assignees.map(a => '@' + a.username)].join(' · ')));
+  c.ondragstart = e => {
+    if (!c.firstChild.checked) { selected().forEach(s => s.firstChild.checked = false); c.firstChild.checked = true; }
+    e.dataTransfer.setData('text/plain', i.web_url);
+  };
+  return c;
+}
+
+async function move(m, list) {
+  const cards = selected().filter(c => c.parentNode !== list);
+  setStatus(`Moving ${cards.length}…`);
+  const res = await Promise.allSettled(cards.map(async c => {
+    const from = c.parentNode;
+    list.append(c); c.firstChild.checked = false;
+    try {
+      await api(`/projects/${c.issue.project_id}/issues/${c.issue.iid}`, { method: 'PUT', body: JSON.stringify({ milestone_id: m ? m.id : 0 }) });
+    } catch (e) { from.append(c); throw e; }
+  }));
+  recount();
+  const bad = res.filter(r => r.status === 'rejected');
+  setStatus(bad.length ? `${bad.length} failed: ${bad[0].reason.message}` : `Moved ${cards.length}`);
+}
+
+function column(m) {
+  const list = el('div', { className: 'cards' });
+  const col = el('section', { className: 'col' },
+    el('h2', {}, m ? el('a', { href: m.web_url, target: '_blank', rel: 'noopener' }, m.title) : 'No milestone',
+      m?.state === 'closed' ? ' (closed)' : '', ' · ', el('span', { className: 'n' })),
+    el('div', { className: 'tools' },
+      el('button', { textContent: 'Move selected here', onclick: run(() => move(m, list)) }),
+      ...(m ? [
+        el('input', { type: 'date', value: m.due_date || '', title: 'Due date', ariaLabel: `${m.title} due date`,
+          onchange: run(async e => { await api(msPath(m), { method: 'PUT', body: JSON.stringify({ due_date: e.target.value || null }) }); setStatus('Due date saved'); }) }),
+        el('button', { textContent: m.state === 'closed' ? 'Reopen' : 'Close', onclick: run(async () => {
+          if (!confirm(`${m.state === 'closed' ? 'Reopen' : 'Close'} milestone "${m.title}"?`)) return;
+          await api(msPath(m), { method: 'PUT', body: JSON.stringify({ state_event: m.state === 'closed' ? 'activate' : 'close' }) });
+          load();
+        }) }),
+      ] : [])),
+    list);
+  col.ondragover = e => { e.preventDefault(); col.classList.add('over'); };
+  col.ondragleave = e => col.contains(e.relatedTarget) || col.classList.remove('over');
+  col.ondrop = run(e => { e.preventDefault(); col.classList.remove('over'); return move(m, list); });
+  return { col, list };
+}
+
+const load = run(async () => {
+  const path = $('scope').value.trim(), kind = kinds.get(path);
+  if (!kind) throw Error('Pick a group or project from the list');
+  localStorage.scope = path;
+  cur = { kind, base: `/${kind}/${encodeURIComponent(path)}` };
+  setStatus('Loading…');
+  const [ms, issues] = await Promise.all([
+    all(cur.base + '/milestones?state=active&include_ancestors=true'),
+    all(cur.base + '/issues?state=opened'),
+  ]);
+  ms.sort((a, b) => (a.due_date || '9999').localeCompare(b.due_date || '9999') || a.title.localeCompare(b.title));
+  const cols = new Map([[0, column(null)], ...ms.map(m => [m.id, column(m)])]);
+  for (const i of issues) {
+    const id = i.milestone?.id ?? 0; // closed/foreign milestones still holding open issues get their own column
+    if (!cols.has(id)) cols.set(id, column(i.milestone));
+    cols.get(id).list.append(card(i));
+  }
+  $('board').replaceChildren(...[...cols.values()].map(c => c.col));
+  $('filter').oninput();
+  setStatus(`${issues.length} open issues, ${ms.length} milestones`);
+});
+
+$('pick').onsubmit = e => { e.preventDefault(); load(); };
+$('filter').oninput = () => {
+  const q = $('filter').value.toLowerCase();
+  $('board').querySelectorAll('.card').forEach(c => c.hidden = !c.textContent.toLowerCase().includes(q));
+  recount();
+};
+$('newMs').onclick = run(async () => {
+  if (!cur) throw Error('Load a group or project first');
+  const title = prompt('New milestone title');
+  if (!title) return;
+  await api(cur.base + '/milestones', { method: 'POST', body: JSON.stringify({ title }) });
+  load();
+});
+$('signout').onclick = () => {
+  fetch(GITLAB + '/oauth/revoke', { method: 'POST', body: new URLSearchParams({ client_id: CLIENT_ID, token: sessionStorage.token || '' }) }).catch(() => {});
+  sessionStorage.clear(); $('board').replaceChildren(); setStatus('Signed out. Reload to sign in.');
+};
+
+(async () => {
+  if (location.hash === '#selftest') { // PKCE S256 encoding: covers '-', '_' and padding strip
+    const ok = b64url(await sha256('abc')) === 'ungWv48Bz-pBQUDeXa4iI7ADYaOWF3qctBD_YfIAFa0';
+    return setStatus(ok ? 'selftest ok' : 'selftest FAILED');
+  }
+  if (!CLIENT_ID) return setStatus('Set CLIENT_ID in index.html');
+  try {
+    if (!await token()) return login();
+    setStatus('Loading groups and projects…');
+    const [groups, projects] = await Promise.all([
+      all('/groups?min_access_level=20'),
+      all('/projects?membership=true&simple=true&archived=false&min_access_level=20'),
+    ]);
+    groups.forEach(g => kinds.set(g.full_path, 'groups'));
+    projects.forEach(p => kinds.set(p.path_with_namespace, 'projects'));
+    $('scopes').replaceChildren(...[...kinds].map(([v, k]) => el('option', { value: v, label: k.slice(0, -1) })));
+    setStatus('Pick a group or project');
+    if (($('scope').value = localStorage.scope || '')) load();
+  } catch (e) { setStatus(e.message); }
+})();
+</script>
