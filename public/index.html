@@ -10,6 +10,8 @@
   header { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 8px; border-bottom: 1px solid GrayText; }
   #scope { width: 22em; max-width: 100%; }
   #status { margin-left: auto; }
+  #nav { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; padding: 6px 8px; border-bottom: 1px solid GrayText; }
+  #nav:empty { display: none; }
   #board { flex: 1; min-height: 0; display: flex; gap: 8px; align-items: flex-start; padding: 8px; overflow-x: auto; }
   .col { flex: 0 0 280px; max-height: 100%; overflow-y: auto; box-sizing: border-box; border: 1px solid GrayText; border-radius: 6px; padding: 6px; }
   .col.over { outline: 2px solid Highlight; }
@@ -36,6 +38,7 @@
   <span id="status" role="status"></span>
   <button id="signout">Sign out</button>
 </header>
+<nav id="nav" aria-label="Groups and projects"></nav>
 <main id="board"></main>
 <dialog id="dlg"><form method="dialog">
   <h3></h3><div class="fields"></div>
@@ -248,16 +251,45 @@ function column(m) {
   return { col, list };
 }
 
+// --- Drill-down nav: breadcrumb up, subgroups/projects down ---
+const parentOf = p => p.split('/').slice(0, -1).join('/');
+const go = p => { $('scope').value = p; load(); };
+const fillList = () => $('scopes').replaceChildren(...[...kinds].map(([v, k]) => el('option', { value: v, label: k.slice(0, -1) })));
+
+function nav(path, children) {
+  const parts = path ? path.split('/') : [];
+  $('nav').replaceChildren(
+    path ? el('button', { textContent: 'All groups', onclick: () => go('') }) : el('b', {}, 'All groups'),
+    ...parts.flatMap((p, i) => {
+      const pre = parts.slice(0, i + 1).join('/');
+      return [' / ', pre !== path && kinds.get(pre) === 'groups' ? el('button', { textContent: p, onclick: () => go(pre) }) : el('b', {}, p)];
+    }),
+    children.length ? ' → ' : '',
+    ...children.sort(([a, x], [b, y]) => x.localeCompare(y) || a.localeCompare(b))
+      .map(([p, k]) => el('button', { textContent: (k === 'groups' ? '📁 ' : '') + p.slice(path ? path.length + 1 : 0), onclick: () => go(p) })));
+}
+
 const load = run(async () => {
   const path = $('scope').value.trim(), kind = kinds.get(path);
-  if (!kind) throw Error('Pick a group or project from the list');
+  if (!kind) { // top level: every group whose parent you can't see
+    localStorage.scope = cur = '';
+    $('board').replaceChildren();
+    nav('', [...kinds].filter(([p, k]) => k === 'groups' && kinds.get(parentOf(p)) !== 'groups'));
+    return setStatus(path ? `"${path}" isn't one of your groups or projects` : 'Pick a group');
+  }
   localStorage.scope = path;
   cur = { kind, base: `/${kind}/${encodeURIComponent(path)}` };
   setStatus('Loading…');
-  const [ms, issues] = await Promise.all([
+  const [ms, issues, subgroups, projects] = await Promise.all([
     all(cur.base + '/milestones?state=active&include_ancestors=true'),
     all(cur.base + '/issues?state=opened'),
+    kind === 'groups' ? all(cur.base + '/subgroups') : [],
+    kind === 'groups' ? all(cur.base + '/projects?archived=false&simple=true') : [],
   ]);
+  const children = [...subgroups.map(g => [g.full_path, 'groups']), ...projects.map(p => [p.path_with_namespace, 'projects'])];
+  children.forEach(([p, k]) => kinds.set(p, k));
+  fillList();
+  nav(path, children);
   ms.sort((a, b) => (a.due_date || '9999').localeCompare(b.due_date || '9999') || a.title.localeCompare(b.title));
   const cols = new Map([[0, column(null)], ...ms.map(m => [m.id, column(m)])]);
   for (const i of issues) {
@@ -299,9 +331,8 @@ $('signout').onclick = () => {
     ]);
     groups.forEach(g => kinds.set(g.full_path, 'groups'));
     projects.forEach(p => kinds.set(p.path_with_namespace, 'projects'));
-    $('scopes').replaceChildren(...[...kinds].map(([v, k]) => el('option', { value: v, label: k.slice(0, -1) })));
-    setStatus('Pick a group or project');
-    if (($('scope').value = localStorage.scope || '')) load();
+    fillList();
+    go(localStorage.scope || '');
   } catch (e) { setStatus(e.message); }
 })();
 </script>

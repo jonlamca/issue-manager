@@ -13,7 +13,8 @@ A static GitLab dashboard on one page. Each milestone gets a column, and you dra
 
 ## Use
 
-- Pick a group or project. Columns are its active milestones (plus inherited ones), "No milestone", and any closed milestone that still has open issues.
+- Start at **All groups**, then drill down: the bar under the header lists the current group's subgroups (📁) and projects, and the breadcrumb takes you back up. A group board covers every project under it.
+- You can also type or pick any group or project path. Columns are its active milestones (plus inherited ones), "No milestone", and any closed milestone that still has open issues.
 - Tick several cards, then drag one of them (or click **Move selected here**) to move them all.
 - **✎** on a card edits its title, description, labels, assignees and due date, or closes the issue.
 - **Edit** on a column edits the milestone's title, description, start and due dates. **Close/Reopen** sits next to it, and **+ Milestone** creates one.
