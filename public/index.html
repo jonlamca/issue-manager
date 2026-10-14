@@ -35,6 +35,7 @@
   <button id="newMs">+ Milestone</button>
   <button id="labels">Labels</button>
   <button id="bulk">Edit selected</button>
+  <button id="manage">Manage group</button>
   <input id="filter" type="search" placeholder="Filter issues" aria-label="Filter issues">
   <span id="status" role="status"></span>
   <button id="signout">Sign out</button>
@@ -45,9 +46,8 @@
   <h3></h3><div class="fields"></div>
   <button>Save</button> <button type="button" onclick="this.closest('dialog').close()">Cancel</button>
 </form></dialog>
-<dialog id="labelsDlg">
-  <h3>Labels</h3>
-  <div id="labelList"></div>
+<dialog id="panel">
+  <h3></h3><div class="body"></div>
   <form method="dialog"><button>Close</button></form>
 </dialog>
 <script>
@@ -133,13 +133,13 @@ const selected = () => [...$('board').querySelectorAll('.card input:checked')].m
 const recount = () => $('board').querySelectorAll('.col').forEach(c => c.querySelector('.n').textContent = c.querySelectorAll('.card:not([hidden])').length);
 
 // --- Edit dialogs ---
-// fields: [name, label, type, value, options?]; first field is required. Resolves to {name: value} or false on cancel.
+// fields: [name, label, type, value, options?]; type 'select' = multi, 'choice' = single; first input is required. Resolves to {name: value} or false on cancel.
 function ask(heading, fields) {
   const d = $('dlg'), form = d.querySelector('form');
   d.querySelector('h3').textContent = heading;
   d.querySelector('.fields').replaceChildren(...fields.map(([name, label, type, value, options], idx) => el('label', {}, label,
     type === 'textarea' ? el('textarea', { name, rows: 6, value: value ?? '' })
-    : type === 'select' ? el('select', { name, multiple: true, size: 6 }, ...options.map(([v, t]) => el('option', { value: v, selected: value.includes(v) }, t)))
+    : type === 'select' || type === 'choice' ? el('select', { name, multiple: type === 'select', size: type === 'select' ? 6 : 1 }, ...options.map(([v, t]) => el('option', { value: v, selected: value.includes(v) }, t)))
     : el('input', { name, type, required: idx === 0, ...(type === 'checkbox' ? { checked: !!value } : { value: value ?? '' }) }))));
   d.showModal();
   return new Promise(res => {
@@ -149,6 +149,19 @@ function ask(heading, fields) {
     })));
     d.onclose = () => d.open || res(false); // close is async: ignore a stale one arriving after the next ask() reopened
   });
+}
+
+function showPanel(title, ...nodes) {
+  const d = $('panel');
+  d.querySelector('h3').textContent = title;
+  d.querySelector('.body').replaceChildren(...nodes);
+  d.open || d.showModal();
+}
+
+// Run fn over items in parallel and report "Done n" or the first failure.
+async function settle(done, items, fn) {
+  const bad = (await Promise.allSettled(items.map(fn))).filter(r => r.status === 'rejected');
+  setStatus(bad.length ? `${bad.length} of ${items.length} failed: ${bad[0].reason.message}` : `${done} ${items.length}`);
 }
 
 const meta = new Map(); // project id -> Promise<[labels, members]>, for the issue editor
@@ -196,7 +209,7 @@ async function showLabels() {
   const parts = cur.path.split('/');
   const levels = parts.map((_, n) => [parts.slice(0, n + 1).join('/'), n === parts.length - 1 ? cur.kind : 'groups']);
   const lists = await Promise.all(levels.map(([p, k]) => all(`/${k}/${encodeURIComponent(p)}/labels?include_ancestor_groups=false`).catch(() => null))); // null: no access
-  $('labelList').replaceChildren(...levels.flatMap(([p, k], n) => {
+  showPanel('Labels', ...levels.flatMap(([p, k], n) => {
     if (!lists[n]) return [];
     const base = `/${k}/${encodeURIComponent(p)}`;
     return [
@@ -211,7 +224,6 @@ async function showLabels() {
       })),
     ];
   }));
-  if (!$('labelsDlg').open) $('labelsDlg').showModal();
 }
 
 async function saveLabel(base, l) {
@@ -238,13 +250,11 @@ async function copyLabels(labels, from) {
   if (!v?.to.length) return;
   const jobs = v.to.flatMap(p => labels.map(l => [`/${kinds.get(p)}/${encodeURIComponent(p)}/labels`, l]));
   setStatus(`Copying ${jobs.length}…`);
-  const res = await Promise.allSettled(jobs.map(([base, { name, color, description }]) =>
+  await settle('Copied', jobs, ([base, { name, color, description }]) =>
     api(base, { method: 'POST', body: JSON.stringify({ name, color, description }) }).catch(e => e.message.startsWith('409')
-      ? api(`${base}/${encodeURIComponent(name)}`, { method: 'PUT', body: JSON.stringify({ color, description }) }) : Promise.reject(e))));
+      ? api(`${base}/${encodeURIComponent(name)}`, { method: 'PUT', body: JSON.stringify({ color, description }) }) : Promise.reject(e)));
   meta.clear();
   await showLabels();
-  const bad = res.filter(r => r.status === 'rejected');
-  setStatus(bad.length ? `${bad.length} of ${jobs.length} failed: ${bad[0].reason.message}` : `Copied ${jobs.length}`);
 }
 
 async function bulkEdit() {
@@ -260,15 +270,13 @@ async function bulkEdit() {
   if (!v) return;
   const body = { add_labels: v.add_labels.join(',') || undefined, remove_labels: v.remove_labels.join(',') || undefined, due_date: v.due_date ?? undefined };
   setStatus(`Saving ${cards.length}…`);
-  const res = await Promise.allSettled(cards.map(async c => {
+  await settle('Updated', cards, async c => { // failures stay ticked for a retry
     let i = c.issue;
     if (Object.values(body).some(x => x)) i = await (await api(`/projects/${i.project_id}/issues/${i.iid}`, { method: 'PUT', body: JSON.stringify(body) })).json();
     if (v.start_date) await setDates(i, v.start_date, i.due_date);
     c.replaceWith(card(i));
-  }));
+  });
   $('filter').oninput();
-  const bad = res.filter(r => r.status === 'rejected');
-  setStatus(bad.length ? `${bad.length} failed (still ticked): ${bad[0].reason.message}` : `Updated ${cards.length}`);
 }
 
 function card(i) {
@@ -279,7 +287,7 @@ function card(i) {
     el('div', { className: 'meta' }, [...i.labels, ...i.assignees.map(a => '@' + a.username), i.due_date && 'due ' + i.due_date].filter(Boolean).join(' · ')));
   c.ondragstart = e => {
     if (!c.firstChild.checked) { selected().forEach(s => s.firstChild.checked = false); c.firstChild.checked = true; }
-    e.dataTransfer.setData('text/plain', i.web_url);
+    e.dataTransfer.setData('text/x-issue', i.web_url);
   };
   return c;
 }
@@ -287,16 +295,14 @@ function card(i) {
 async function move(m, list) {
   const cards = selected().filter(c => c.parentNode !== list);
   setStatus(`Moving ${cards.length}…`);
-  const res = await Promise.allSettled(cards.map(async c => {
+  await settle('Moved', cards, async c => {
     const from = c.parentNode;
     list.append(c); c.firstChild.checked = false;
     try {
       await api(`/projects/${c.issue.project_id}/issues/${c.issue.iid}`, { method: 'PUT', body: JSON.stringify({ milestone_id: m ? m.id : 0 }) });
     } catch (e) { from.append(c); throw e; }
-  }));
+  });
   recount();
-  const bad = res.filter(r => r.status === 'rejected');
-  setStatus(bad.length ? `${bad.length} failed: ${bad[0].reason.message}` : `Moved ${cards.length}`);
 }
 
 function column(m) {
@@ -316,7 +322,7 @@ function column(m) {
         }) }),
       ] : [])),
     list);
-  col.ondragover = e => { e.preventDefault(); col.classList.add('over'); };
+  col.ondragover = e => { if (e.dataTransfer.types.includes('text/x-issue')) { e.preventDefault(); col.classList.add('over'); } };
   col.ondragleave = e => col.contains(e.relatedTarget) || col.classList.remove('over');
   col.ondrop = run(e => { e.preventDefault(); col.classList.remove('over'); return move(m, list); });
   return { col, list };
@@ -332,17 +338,82 @@ async function resolve(p) {
 const go = p => { $('scope').value = p; load(); };
 const fillList = () => $('scopes').replaceChildren(...[...kinds].map(([v, k]) => el('option', { value: v, label: k.slice(0, -1) })));
 
+async function transfer(p, ns) {
+  const moved = await (await api(`/projects/${encodeURIComponent(p)}/transfer`, { method: 'PUT', body: JSON.stringify({ namespace: ns }) })).json();
+  kinds.delete(p);
+  kinds.set(moved.path_with_namespace, 'projects');
+}
+
+// Drop a dragged project chip on a group button to transfer it there.
+const dropTarget = (b, ns) => Object.assign(b, {
+  ondragover: e => e.dataTransfer.types.includes('text/x-project') && e.preventDefault(),
+  ondrop: run(async e => {
+    const p = e.dataTransfer.getData('text/x-project');
+    if (parentOf(p) === ns || !confirm(`Move project ${p} into ${ns}?`)) return;
+    await transfer(p, ns);
+    await load();
+    setStatus(`Moved ${p} to ${ns}`);
+  }),
+});
+
 function nav(path, children) {
   const parts = path ? path.split('/') : [];
   $('nav').replaceChildren(
     path ? el('button', { textContent: 'All groups', onclick: () => go('') }) : el('b', {}, 'All groups'),
     ...parts.flatMap((p, i) => {
       const pre = parts.slice(0, i + 1).join('/');
-      return [' / ', pre !== path ? el('button', { textContent: p, onclick: () => go(pre) }) : el('b', {}, p)];
+      return [' / ', pre !== path ? dropTarget(el('button', { textContent: p, onclick: () => go(pre) }), pre) : el('b', {}, p)];
     }),
     children.length ? ' → ' : '',
     ...children.sort(([a, x], [b, y]) => x.localeCompare(y) || a.localeCompare(b))
-      .map(([p, k]) => el('button', { textContent: (k === 'groups' ? '📁 ' : '') + p.slice(path ? path.length + 1 : 0), onclick: () => go(p) })));
+      .map(([p, k]) => {
+        const b = el('button', { textContent: (k === 'groups' ? '📁 ' : '') + p.slice(path ? path.length + 1 : 0), onclick: () => go(p) });
+        return k === 'groups' ? dropTarget(b, p) : Object.assign(b, { draggable: true, ondragstart: e => e.dataTransfer.setData('text/x-project', p) });
+      }));
+}
+
+// --- Manage a group: archive / move projects, delete empty subgroups ---
+async function manage() {
+  if (cur?.kind !== 'groups') throw Error('Open a group to manage its projects and subgroups');
+  const [groups, projects] = await Promise.all([all(cur.base + '/descendant_groups'), all(cur.base + '/projects?include_subgroups=true&with_shared=false')]);
+  groups.forEach(g => kinds.set(g.full_path, 'groups'));
+  projects.forEach(p => kinds.set(p.path_with_namespace, 'projects'));
+  fillList();
+  const rel = p => p.slice(cur.path.length + 1);
+  const ticked = ul => { const v = [...ul.querySelectorAll(':checked')].map(x => x.value); if (!v.length) throw Error('Tick some first'); return v; };
+  const box = (value, text) => el('li', {}, el('label', {}, el('input', { type: 'checkbox', value }), ' ', text));
+  const act = (text, fn) => el('button', { textContent: text, onclick: run(async () => {
+    if (await fn() === false) return;
+    const msg = $('status').textContent; // keep the result over load()'s summary
+    await Promise.all([load(), manage()]);
+    setStatus(msg);
+  }) });
+  const enc = encodeURIComponent;
+
+  const pl = el('ul', {}, ...projects.map(p => p.path_with_namespace).sort().map(p => box(p, rel(p) + (projects.find(x => x.path_with_namespace === p).archived ? ' (archived)' : ''))));
+  // Empty = no subgroups and no projects (archived ones count). Delete leaves first, then their parents become empty.
+  const empty = groups.filter(g => !groups.some(c => c.parent_id === g.id) && !projects.some(p => p.namespace.id === g.id));
+  const gl = el('ul', {}, ...empty.map(g => box(g.full_path, rel(g.full_path))));
+
+  showPanel(`Manage ${cur.path}`,
+    el('h4', {}, `Projects (${projects.length}) `,
+      act('Archive', () => settle('Archived', ticked(pl), p => api(`/projects/${enc(p)}/archive`, { method: 'POST' }))), ' ',
+      act('Unarchive', () => settle('Unarchived', ticked(pl), p => api(`/projects/${enc(p)}/unarchive`, { method: 'POST' }))), ' ',
+      act('Move to…', async () => {
+        const ps = ticked(pl);
+        const v = await ask(`Move ${ps.length} project${ps.length > 1 ? 's' : ''}`, [['to', 'Into group', 'choice', cur.path,
+          [...kinds].filter(([, k]) => k === 'groups').map(([g]) => [g, g]).sort()]]);
+        if (!v) return false;
+        await settle('Moved', ps.filter(p => parentOf(p) !== v.to), p => transfer(p, v.to));
+      })),
+    projects.length ? pl : 'No projects.',
+    el('h4', {}, `Empty subgroups (${empty.length}) `,
+      act('Delete', async () => {
+        const gs = ticked(gl);
+        if (!confirm(`Delete ${gs.length} empty group(s)?\n${gs.join('\n')}\n\nTheir labels and milestones go with them.`)) return false;
+        await settle('Deleted', gs, async g => { await api(`/groups/${enc(g)}`, { method: 'DELETE' }); kinds.delete(g); });
+      })),
+    empty.length ? gl : 'None.');
 }
 
 const load = run(async () => {
@@ -360,7 +431,7 @@ const load = run(async () => {
     all(`${cur.base}/milestones?state=active&${inherit}=true`),
     all(cur.base + '/issues?state=opened'),
     kind === 'groups' ? all(cur.base + '/subgroups') : [],
-    kind === 'groups' ? all(cur.base + '/projects?archived=false&simple=true') : [],
+    kind === 'groups' ? all(cur.base + '/projects?archived=false&simple=true&with_shared=false') : [],
   ]);
   const children = [...subgroups.map(g => [g.full_path, 'groups']), ...projects.map(p => [p.path_with_namespace, 'projects'])];
   children.forEach(([p, k]) => kinds.set(p, k));
@@ -387,6 +458,7 @@ $('filter').oninput = () => {
 $('newMs').onclick = run(() => saveMs(null));
 $('labels').onclick = run(showLabels);
 $('bulk').onclick = run(bulkEdit);
+$('manage').onclick = run(manage);
 $('signout').onclick = () => {
   fetch(GITLAB + '/oauth/revoke', { method: 'POST', body: new URLSearchParams({ client_id: CLIENT_ID, token: sessionStorage.token || '' }) }).catch(() => {});
   sessionStorage.clear(); $('board').replaceChildren(); setStatus('Signed out. Reload to sign in.');

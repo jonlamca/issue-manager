@@ -17,6 +17,8 @@ A static GitLab dashboard on one page. Each milestone gets a column, and you dra
 ## Use
 
 - Start at **All groups**, then drill down: the bar under the header lists the current group's subgroups (📁) and projects, and the breadcrumb takes you back up. A group board covers every project under it.
+- **Moving projects:** drag a project button in that bar onto a 📁 subgroup or a breadcrumb group to transfer it there (you'll be asked to confirm).
+- **Manage group** lists every project under the group, including archived ones and those in subgroups. Tick projects to **Archive**, **Unarchive** or **Move to…** another group. It also lists empty subgroups (no projects and no subgroups) for **Delete**. Delete the deepest ones first, and their parents become empty in turn.
 - You can also type or pick any group or project path. Columns are its active milestones (plus inherited ones), "No milestone", and any closed milestone that still has open issues.
 - Tick several cards, then drag one of them (or click **Move selected here**) to move them all.
 - **✎** on a card edits its title, description, labels, assignees, start and due dates, or closes the issue. Start dates use GitLab work items through GraphQL; the field is hidden if your instance doesn't support them.
