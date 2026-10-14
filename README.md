@@ -16,7 +16,8 @@ A static GitLab dashboard on one page. Each milestone gets a column, and you dra
 - Start at **All groups**, then drill down: the bar under the header lists the current group's subgroups (📁) and projects, and the breadcrumb takes you back up. A group board covers every project under it.
 - You can also type or pick any group or project path. Columns are its active milestones (plus inherited ones), "No milestone", and any closed milestone that still has open issues.
 - Tick several cards, then drag one of them (or click **Move selected here**) to move them all.
-- **✎** on a card edits its title, description, labels, assignees and due date, or closes the issue.
-- **Edit** on a column edits the milestone's title, description, start and due dates. **Close/Reopen** sits next to it, and **+ Milestone** creates one.
-- **Labels** lists every label available to the group or project, including inherited group labels, and lets you add or edit them. New labels are created at the level you have loaded.
+- **✎** on a card edits its title, description, labels, assignees, start and due dates, or closes the issue. Start dates use GitLab work items through GraphQL; the field is hidden if your instance doesn't support them.
+- **Edit selected** on ticked cards adds or removes labels and sets start or due dates across all of them. Blank fields are left unchanged.
+- **Edit** on a column edits the milestone's title, description, and start and due dates (both optional). The header shows the period. **Close/Reopen** sits next to it, and **+ Milestone** creates one.
+- **Labels** shows one section per level, from the top group down to what you've loaded. Each label is added or edited at its own level, so group labels can be edited from inside a project.
 - Open `index.html#selftest` to check the PKCE encoding.

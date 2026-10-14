@@ -34,6 +34,7 @@
   </form>
   <button id="newMs">+ Milestone</button>
   <button id="labels">Labels</button>
+  <button id="bulk">Edit selected</button>
   <input id="filter" type="search" placeholder="Filter issues" aria-label="Filter issues">
   <span id="status" role="status"></span>
   <button id="signout">Sign out</button>
@@ -45,8 +46,8 @@
   <button>Save</button> <button type="button" onclick="this.closest('dialog').close()">Cancel</button>
 </form></dialog>
 <dialog id="labelsDlg">
-  <h3>Labels</h3><button id="newLabel">+ Label</button>
-  <ul id="labelList"></ul>
+  <h3>Labels</h3>
+  <div id="labelList"></div>
   <form method="dialog"><button>Close</button></form>
 </dialog>
 <script>
@@ -62,7 +63,7 @@ const el = (tag, props = {}, ...kids) => { const e = Object.assign(document.crea
 const b64url = buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 const sha256 = s => crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
 const kinds = new Map(); // full path -> 'groups' | 'projects'
-let cur; // { kind, base }
+let cur; // { kind, path, base }
 
 // --- OAuth (authorization code + PKCE, no backend) ---
 async function login() {
@@ -94,7 +95,7 @@ async function token() {
 
 // ponytail: token expires after 2h and we just re-run SSO; use refresh_token if the redirect bothers you.
 async function api(path, opts = {}) {
-  const r = await fetch(GITLAB + '/api/v4' + path, { ...opts, headers: {
+  const r = await fetch(GITLAB + (path.startsWith('/api/') ? path : '/api/v4' + path), { ...opts, headers: {
     Authorization: 'Bearer ' + sessionStorage.token, ...(opts.body && { 'Content-Type': 'application/json' }),
   } });
   if (r.status === 401) { sessionStorage.removeItem('token'); login(); throw Error('Session expired, signing in…'); }
@@ -111,6 +112,18 @@ async function all(path) {
   }
   return out;
 }
+
+// Issue start dates only exist on work items (GraphQL); due dates stay on REST so they work everywhere.
+async function gql(query, variables) {
+  const j = await (await api('/api/graphql', { method: 'POST', body: JSON.stringify({ query, variables }) })).json();
+  const err = j.errors?.[0]?.message ?? Object.values(j.data ?? {})[0]?.errors?.[0];
+  if (err) throw Error(err);
+  return j.data;
+}
+const wid = i => `gid://gitlab/WorkItem/${i.id}`;
+const getStart = i => gql('query($id: WorkItemID!) { workItem(id: $id) { widgets { ... on WorkItemWidgetStartAndDueDate { startDate } } } }', { id: wid(i) })
+  .then(d => d.workItem?.widgets.find(w => 'startDate' in w)).then(w => w ? w.startDate : undefined, () => undefined); // undefined: no start dates here
+const setDates = (i, s, d) => gql('mutation($id: WorkItemID!, $s: Date, $d: Date) { workItemUpdate(input: { id: $id, startAndDueDateWidget: { startDate: $s, dueDate: $d } }) { errors } }', { id: wid(i), s, d });
 
 // --- Board: one column per milestone, drag issues between them ---
 const msPath = m => m.project_id ? `/projects/${m.project_id}/milestones/${m.id}` : `/groups/${m.group_id}/milestones/${m.id}`;
@@ -141,21 +154,23 @@ const projectMeta = pid => meta.get(pid) ?? meta.set(pid, Promise.all([all(`/pro
   .catch(e => { meta.delete(pid); throw e; })).get(pid);
 
 async function editIssue(c) {
-  const i = c.issue, [labels, members] = await projectMeta(i.project_id);
+  const i = c.issue, [[labels, members], start] = await Promise.all([projectMeta(i.project_id), getStart(i)]);
   const v = await ask(`Edit ${i.references.relative}`, [
     ['title', 'Title', 'text', i.title],
     ['description', 'Description', 'textarea', i.description],
     ['labels', 'Labels', 'select', i.labels, [...new Set([...i.labels, ...labels.map(l => l.name)])].map(n => [n, n])],
     ['assignee_ids', 'Assignees', 'select', i.assignees.map(a => String(a.id)),
       [...new Map([...i.assignees, ...members].map(m => [String(m.id), `${m.name} (@${m.username})`]))]],
+    ...(start === undefined ? [] : [['start_date', 'Start date', 'date', start]]),
     ['due_date', 'Due date', 'date', i.due_date],
     ['close', 'Close issue', 'checkbox', false],
   ]);
   if (!v) return;
-  const { close, ...body } = v;
+  const { close, start_date, ...body } = v;
   const r = await api(`/projects/${i.project_id}/issues/${i.iid}`, { method: 'PUT', body: JSON.stringify({
     ...body, labels: body.labels.join(','), assignee_ids: body.assignee_ids.map(Number), state_event: close ? 'close' : undefined,
   }) });
+  if (start_date !== undefined && start_date !== start) await setDates(i, start_date, body.due_date);
   close ? c.remove() : c.replaceWith(card(await r.json()));
   $('filter').oninput();
   setStatus(close ? 'Issue closed' : 'Issue saved');
@@ -176,28 +191,61 @@ async function saveMs(m) {
 
 async function showLabels() {
   if (!cur) throw Error('Load a group or project first');
-  const labels = await all(cur.base + '/labels?include_ancestor_groups=true');
-  $('labelList').replaceChildren(...labels.map(l => {
-    const sw = el('span', { className: 'sw' });
-    sw.style.background = l.color;
-    return el('li', {}, sw, ' ', l.name, l.is_project_label === false ? ' (group)' : '', l.description ? ` — ${l.description}` : '', ' ',
-      el('button', { textContent: 'Edit', onclick: run(() => saveLabel(l)) }));
+  const parts = cur.path.split('/');
+  const levels = parts.map((_, n) => [parts.slice(0, n + 1).join('/'), n === parts.length - 1 ? cur.kind : 'groups']);
+  const lists = await Promise.all(levels.map(([p, k]) => all(`/${k}/${encodeURIComponent(p)}/labels?include_ancestor_groups=false`).catch(() => null))); // null: no access
+  $('labelList').replaceChildren(...levels.flatMap(([p, k], n) => {
+    if (!lists[n]) return [];
+    const base = `/${k}/${encodeURIComponent(p)}`;
+    return [
+      el('h4', {}, `${p} (${k.slice(0, -1)}) `, el('button', { textContent: '+ Label', onclick: run(() => saveLabel(base, null)) })),
+      el('ul', {}, ...lists[n].map(l => {
+        const sw = el('span', { className: 'sw' });
+        sw.style.background = l.color;
+        return el('li', {}, sw, ' ', l.name, l.description ? ` — ${l.description}` : '', ' ',
+          el('button', { textContent: 'Edit', onclick: run(() => saveLabel(base, l)) }));
+      })),
+    ];
   }));
   if (!$('labelsDlg').open) $('labelsDlg').showModal();
 }
 
-async function saveLabel(l) {
+async function saveLabel(base, l) {
   const v = await ask(l ? `Edit label ${l.name}` : 'New label', [
     ['name', 'Name', 'text', l?.name],
     ['color', 'Color', 'color', l?.color ?? '#428bca'],
     ['description', 'Description', 'text', l?.description],
   ]);
   if (!v) return;
-  await api(l ? `${cur.base}/labels/${l.id}` : cur.base + '/labels', { method: l ? 'PUT' : 'POST',
+  await api(l ? `${base}/labels/${l.id}` : base + '/labels', { method: l ? 'PUT' : 'POST',
     body: JSON.stringify(l ? { new_name: v.name !== l.name ? v.name : undefined, color: v.color, description: v.description } : v) });
   meta.clear();
   await showLabels();
   load();
+}
+
+async function bulkEdit() {
+  const cards = selected();
+  if (!cards.length) throw Error('Tick some issues first');
+  const opts = [...new Set((await all(cur.base + '/labels?include_ancestor_groups=true')).map(l => l.name))].map(n => [n, n]);
+  const v = await ask(`Edit ${cards.length} selected issues (blank = unchanged)`, [
+    ['add_labels', 'Add labels', 'select', [], opts],
+    ['remove_labels', 'Remove labels', 'select', [], opts],
+    ['start_date', 'Start date', 'date', null],
+    ['due_date', 'Due date', 'date', null],
+  ]);
+  if (!v) return;
+  const body = { add_labels: v.add_labels.join(',') || undefined, remove_labels: v.remove_labels.join(',') || undefined, due_date: v.due_date ?? undefined };
+  setStatus(`Saving ${cards.length}…`);
+  const res = await Promise.allSettled(cards.map(async c => {
+    let i = c.issue;
+    if (Object.values(body).some(x => x)) i = await (await api(`/projects/${i.project_id}/issues/${i.iid}`, { method: 'PUT', body: JSON.stringify(body) })).json();
+    if (v.start_date) await setDates(i, v.start_date, i.due_date);
+    c.replaceWith(card(i));
+  }));
+  $('filter').oninput();
+  const bad = res.filter(r => r.status === 'rejected');
+  setStatus(bad.length ? `${bad.length} failed (still ticked): ${bad[0].reason.message}` : `Updated ${cards.length}`);
 }
 
 function card(i) {
@@ -205,7 +253,7 @@ function card(i) {
     el('input', { type: 'checkbox' }), ' ',
     el('button', { textContent: '✎', title: 'Edit issue', ariaLabel: 'Edit issue', onclick: run(e => { e.preventDefault(); return editIssue(c); }) }), ' ',
     el('a', { href: i.web_url, target: '_blank', rel: 'noopener' }, i.references.relative), ' ', i.title,
-    el('div', { className: 'meta' }, [...i.labels, ...i.assignees.map(a => '@' + a.username)].join(' · ')));
+    el('div', { className: 'meta' }, [...i.labels, ...i.assignees.map(a => '@' + a.username), i.due_date && 'due ' + i.due_date].filter(Boolean).join(' · ')));
   c.ondragstart = e => {
     if (!c.firstChild.checked) { selected().forEach(s => s.firstChild.checked = false); c.firstChild.checked = true; }
     e.dataTransfer.setData('text/plain', i.web_url);
@@ -237,7 +285,7 @@ function column(m) {
       el('button', { textContent: 'Move selected here', onclick: run(() => move(m, list)) }),
       ...(m ? [
         el('button', { textContent: 'Edit', onclick: run(() => saveMs(m)) }),
-        m.due_date ? ` due ${m.due_date}` : '',
+        m.start_date || m.due_date ? ` ${m.start_date ?? '…'} → ${m.due_date ?? '…'}` : '',
         el('button', { textContent: m.state === 'closed' ? 'Reopen' : 'Close', onclick: run(async () => {
           if (!confirm(`${m.state === 'closed' ? 'Reopen' : 'Close'} milestone "${m.title}"?`)) return;
           await api(msPath(m), { method: 'PUT', body: JSON.stringify({ state_event: m.state === 'closed' ? 'activate' : 'close' }) });
@@ -278,7 +326,7 @@ const load = run(async () => {
     return setStatus(path ? `"${path}" isn't one of your groups or projects` : 'Pick a group');
   }
   localStorage.scope = path;
-  cur = { kind, base: `/${kind}/${encodeURIComponent(path)}` };
+  cur = { kind, path, base: `/${kind}/${encodeURIComponent(path)}` };
   setStatus('Loading…');
   const [ms, issues, subgroups, projects] = await Promise.all([
     all(cur.base + '/milestones?state=active&include_ancestors=true'),
@@ -310,7 +358,7 @@ $('filter').oninput = () => {
 };
 $('newMs').onclick = run(() => saveMs(null));
 $('labels').onclick = run(showLabels);
-$('newLabel').onclick = run(() => saveLabel(null));
+$('bulk').onclick = run(bulkEdit);
 $('signout').onclick = () => {
   fetch(GITLAB + '/oauth/revoke', { method: 'POST', body: new URLSearchParams({ client_id: CLIENT_ID, token: sessionStorage.token || '' }) }).catch(() => {});
   sessionStorage.clear(); $('board').replaceChildren(); setStatus('Signed out. Reload to sign in.');
