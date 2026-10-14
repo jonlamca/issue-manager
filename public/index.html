@@ -19,6 +19,10 @@
   .card { display: block; padding: 6px; border: 1px solid GrayText; border-radius: 4px; cursor: grab; }
   .card:has(:checked) { outline: 2px solid Highlight; }
   .meta { font-size: 12px; opacity: .7; }
+  dialog { width: min(480px, 90vw); }
+  dialog label { display: block; margin: 8px 0; }
+  dialog label > :not([type=checkbox]) { display: block; width: 100%; box-sizing: border-box; }
+  .sw { display: inline-block; width: 1em; height: 1em; border-radius: 3px; vertical-align: middle; }
 </style>
 <header>
   <form id="pick">
@@ -27,11 +31,21 @@
     <button>Load</button>
   </form>
   <button id="newMs">+ Milestone</button>
+  <button id="labels">Labels</button>
   <input id="filter" type="search" placeholder="Filter issues" aria-label="Filter issues">
   <span id="status" role="status"></span>
   <button id="signout">Sign out</button>
 </header>
 <main id="board"></main>
+<dialog id="dlg"><form method="dialog">
+  <h3></h3><div class="fields"></div>
+  <button>Save</button> <button type="button" onclick="this.closest('dialog').close()">Cancel</button>
+</form></dialog>
+<dialog id="labelsDlg">
+  <h3>Labels</h3><button id="newLabel">+ Label</button>
+  <ul id="labelList"></ul>
+  <form method="dialog"><button>Close</button></form>
+</dialog>
 <script>
 // Edit these two, then deploy.
 const GITLAB = 'https://gitlab.com';
@@ -100,9 +114,93 @@ const msPath = m => m.project_id ? `/projects/${m.project_id}/milestones/${m.id}
 const selected = () => [...$('board').querySelectorAll('.card input:checked')].map(i => i.closest('.card'));
 const recount = () => $('board').querySelectorAll('.col').forEach(c => c.querySelector('.n').textContent = c.querySelectorAll('.card:not([hidden])').length);
 
+// --- Edit dialogs ---
+// fields: [name, label, type, value, options?]; first field is required. Resolves to {name: value} or false on cancel.
+function ask(heading, fields) {
+  const d = $('dlg'), form = d.querySelector('form');
+  d.querySelector('h3').textContent = heading;
+  d.querySelector('.fields').replaceChildren(...fields.map(([name, label, type, value, options], idx) => el('label', {}, label,
+    type === 'textarea' ? el('textarea', { name, rows: 6, value: value ?? '' })
+    : type === 'select' ? el('select', { name, multiple: true, size: 6 }, ...options.map(([v, t]) => el('option', { value: v, selected: value.includes(v) }, t)))
+    : el('input', { name, type, required: idx === 0, ...(type === 'checkbox' ? { checked: !!value } : { value: value ?? '' }) }))));
+  d.showModal();
+  return new Promise(res => {
+    form.onsubmit = () => res(Object.fromEntries(fields.map(([name, , type]) => {
+      const x = form.elements[name];
+      return [name, type === 'select' ? [...x.selectedOptions].map(o => o.value) : type === 'checkbox' ? x.checked : type === 'date' ? x.value || null : x.value];
+    })));
+    d.onclose = () => d.open || res(false); // close is async: ignore a stale one arriving after the next ask() reopened
+  });
+}
+
+const meta = new Map(); // project id -> Promise<[labels, members]>, for the issue editor
+const projectMeta = pid => meta.get(pid) ?? meta.set(pid, Promise.all([all(`/projects/${pid}/labels`), all(`/projects/${pid}/members/all`)])
+  .catch(e => { meta.delete(pid); throw e; })).get(pid);
+
+async function editIssue(c) {
+  const i = c.issue, [labels, members] = await projectMeta(i.project_id);
+  const v = await ask(`Edit ${i.references.relative}`, [
+    ['title', 'Title', 'text', i.title],
+    ['description', 'Description', 'textarea', i.description],
+    ['labels', 'Labels', 'select', i.labels, [...new Set([...i.labels, ...labels.map(l => l.name)])].map(n => [n, n])],
+    ['assignee_ids', 'Assignees', 'select', i.assignees.map(a => String(a.id)),
+      [...new Map([...i.assignees, ...members].map(m => [String(m.id), `${m.name} (@${m.username})`]))]],
+    ['due_date', 'Due date', 'date', i.due_date],
+    ['close', 'Close issue', 'checkbox', false],
+  ]);
+  if (!v) return;
+  const { close, ...body } = v;
+  const r = await api(`/projects/${i.project_id}/issues/${i.iid}`, { method: 'PUT', body: JSON.stringify({
+    ...body, labels: body.labels.join(','), assignee_ids: body.assignee_ids.map(Number), state_event: close ? 'close' : undefined,
+  }) });
+  close ? c.remove() : c.replaceWith(card(await r.json()));
+  $('filter').oninput();
+  setStatus(close ? 'Issue closed' : 'Issue saved');
+}
+
+async function saveMs(m) {
+  if (!cur) throw Error('Load a group or project first');
+  const v = await ask(m ? `Edit milestone ${m.title}` : 'New milestone', [
+    ['title', 'Title', 'text', m?.title],
+    ['description', 'Description', 'textarea', m?.description],
+    ['start_date', 'Start date', 'date', m?.start_date],
+    ['due_date', 'Due date', 'date', m?.due_date],
+  ]);
+  if (!v) return;
+  await api(m ? msPath(m) : cur.base + '/milestones', { method: m ? 'PUT' : 'POST', body: JSON.stringify(v) });
+  load();
+}
+
+async function showLabels() {
+  if (!cur) throw Error('Load a group or project first');
+  const labels = await all(cur.base + '/labels?include_ancestor_groups=true');
+  $('labelList').replaceChildren(...labels.map(l => {
+    const sw = el('span', { className: 'sw' });
+    sw.style.background = l.color;
+    return el('li', {}, sw, ' ', l.name, l.is_project_label === false ? ' (group)' : '', l.description ? ` — ${l.description}` : '', ' ',
+      el('button', { textContent: 'Edit', onclick: run(() => saveLabel(l)) }));
+  }));
+  if (!$('labelsDlg').open) $('labelsDlg').showModal();
+}
+
+async function saveLabel(l) {
+  const v = await ask(l ? `Edit label ${l.name}` : 'New label', [
+    ['name', 'Name', 'text', l?.name],
+    ['color', 'Color', 'color', l?.color ?? '#428bca'],
+    ['description', 'Description', 'text', l?.description],
+  ]);
+  if (!v) return;
+  await api(l ? `${cur.base}/labels/${l.id}` : cur.base + '/labels', { method: l ? 'PUT' : 'POST',
+    body: JSON.stringify(l ? { new_name: v.name !== l.name ? v.name : undefined, color: v.color, description: v.description } : v) });
+  meta.clear();
+  await showLabels();
+  load();
+}
+
 function card(i) {
   const c = el('label', { className: 'card', draggable: true, issue: i },
     el('input', { type: 'checkbox' }), ' ',
+    el('button', { textContent: '✎', title: 'Edit issue', ariaLabel: 'Edit issue', onclick: run(e => { e.preventDefault(); return editIssue(c); }) }), ' ',
     el('a', { href: i.web_url, target: '_blank', rel: 'noopener' }, i.references.relative), ' ', i.title,
     el('div', { className: 'meta' }, [...i.labels, ...i.assignees.map(a => '@' + a.username)].join(' · ')));
   c.ondragstart = e => {
@@ -135,8 +233,8 @@ function column(m) {
     el('div', { className: 'tools' },
       el('button', { textContent: 'Move selected here', onclick: run(() => move(m, list)) }),
       ...(m ? [
-        el('input', { type: 'date', value: m.due_date || '', title: 'Due date', ariaLabel: `${m.title} due date`,
-          onchange: run(async e => { await api(msPath(m), { method: 'PUT', body: JSON.stringify({ due_date: e.target.value || null }) }); setStatus('Due date saved'); }) }),
+        el('button', { textContent: 'Edit', onclick: run(() => saveMs(m)) }),
+        m.due_date ? ` due ${m.due_date}` : '',
         el('button', { textContent: m.state === 'closed' ? 'Reopen' : 'Close', onclick: run(async () => {
           if (!confirm(`${m.state === 'closed' ? 'Reopen' : 'Close'} milestone "${m.title}"?`)) return;
           await api(msPath(m), { method: 'PUT', body: JSON.stringify({ state_event: m.state === 'closed' ? 'activate' : 'close' }) });
@@ -178,13 +276,9 @@ $('filter').oninput = () => {
   $('board').querySelectorAll('.card').forEach(c => c.hidden = !c.textContent.toLowerCase().includes(q));
   recount();
 };
-$('newMs').onclick = run(async () => {
-  if (!cur) throw Error('Load a group or project first');
-  const title = prompt('New milestone title');
-  if (!title) return;
-  await api(cur.base + '/milestones', { method: 'POST', body: JSON.stringify({ title }) });
-  load();
-});
+$('newMs').onclick = run(() => saveMs(null));
+$('labels').onclick = run(showLabels);
+$('newLabel').onclick = run(() => saveLabel(null));
 $('signout').onclick = () => {
   fetch(GITLAB + '/oauth/revoke', { method: 'POST', body: new URLSearchParams({ client_id: CLIENT_ID, token: sessionStorage.token || '' }) }).catch(() => {});
   sessionStorage.clear(); $('board').replaceChildren(); setStatus('Signed out. Reload to sign in.');
