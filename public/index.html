@@ -51,9 +51,10 @@
   <form method="dialog"><button>Close</button></form>
 </dialog>
 <script>
-// Edit these two, then deploy.
-const GITLAB = 'https://gitlab.com';
+// Edit these, then deploy.
+const GITLAB = 'https://gitlab.com'; // or your self-managed URL (GitLab 15.1+ for browser SSO)
 const CLIENT_ID = ''; // OAuth application ID (non-confidential, scope: api)
+const GROUPS = []; // groups to manage, e.g. ['my-group', 'other/sub']; empty = every group you're a member of
 
 const REDIRECT = location.origin + location.pathname;
 const $ = id => document.getElementById(id);
@@ -64,6 +65,7 @@ const b64url = buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(
 const sha256 = s => crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
 const kinds = new Map(); // full path -> 'groups' | 'projects'
 let cur; // { kind, path, base }
+let inherit = 'include_ancestors'; // milestones from parent groups; 'include_parent_milestones' before GitLab 16.7
 
 // --- OAuth (authorization code + PKCE, no backend) ---
 async function login() {
@@ -198,12 +200,14 @@ async function showLabels() {
     if (!lists[n]) return [];
     const base = `/${k}/${encodeURIComponent(p)}`;
     return [
-      el('h4', {}, `${p} (${k.slice(0, -1)}) `, el('button', { textContent: '+ Label', onclick: run(() => saveLabel(base, null)) })),
+      el('h4', {}, `${p} (${k.slice(0, -1)}) `, el('button', { textContent: '+ Label', onclick: run(() => saveLabel(base, null)) }), ' ',
+        el('button', { textContent: 'Copy all to…', onclick: run(() => copyLabels(lists[n], p)) })),
       el('ul', {}, ...lists[n].map(l => {
         const sw = el('span', { className: 'sw' });
         sw.style.background = l.color;
         return el('li', {}, sw, ' ', l.name, l.description ? ` — ${l.description}` : '', ' ',
-          el('button', { textContent: 'Edit', onclick: run(() => saveLabel(base, l)) }));
+          el('button', { textContent: 'Edit', onclick: run(() => saveLabel(base, l)) }), ' ',
+          el('button', { textContent: 'Copy to…', onclick: run(() => copyLabels([l], p)) }));
       })),
     ];
   }));
@@ -222,6 +226,25 @@ async function saveLabel(base, l) {
   meta.clear();
   await showLabels();
   load();
+}
+
+// GitLab can't share a label across unrelated groups, so "apply" = create (or update) a same-named label there.
+async function copyLabels(labels, from) {
+  if (!labels.length) throw Error('No labels to copy');
+  const v = await ask(`Copy ${labels.length === 1 ? `"${labels[0].name}"` : `${labels.length} labels`} from ${from}`, [
+    ['to', 'To (a label with the same name gets its colour and description updated)', 'select', [],
+      [...kinds].filter(([p]) => p !== from).sort().map(([p, k]) => [p, `${p} (${k.slice(0, -1)})`])],
+  ]);
+  if (!v?.to.length) return;
+  const jobs = v.to.flatMap(p => labels.map(l => [`/${kinds.get(p)}/${encodeURIComponent(p)}/labels`, l]));
+  setStatus(`Copying ${jobs.length}…`);
+  const res = await Promise.allSettled(jobs.map(([base, { name, color, description }]) =>
+    api(base, { method: 'POST', body: JSON.stringify({ name, color, description }) }).catch(e => e.message.startsWith('409')
+      ? api(`${base}/${encodeURIComponent(name)}`, { method: 'PUT', body: JSON.stringify({ color, description }) }) : Promise.reject(e))));
+  meta.clear();
+  await showLabels();
+  const bad = res.filter(r => r.status === 'rejected');
+  setStatus(bad.length ? `${bad.length} of ${jobs.length} failed: ${bad[0].reason.message}` : `Copied ${jobs.length}`);
 }
 
 async function bulkEdit() {
@@ -301,6 +324,11 @@ function column(m) {
 
 // --- Drill-down nav: breadcrumb up, subgroups/projects down ---
 const parentOf = p => p.split('/').slice(0, -1).join('/');
+async function resolve(p) {
+  if (!p || kinds.has(p)) return kinds.get(p);
+  for (const k of ['groups', 'projects'])
+    if (await api(`/${k}/${encodeURIComponent(p)}${k === 'groups' ? '?with_projects=false' : ''}`).then(() => true, () => false)) return kinds.set(p, k).get(p);
+}
 const go = p => { $('scope').value = p; load(); };
 const fillList = () => $('scopes').replaceChildren(...[...kinds].map(([v, k]) => el('option', { value: v, label: k.slice(0, -1) })));
 
@@ -310,7 +338,7 @@ function nav(path, children) {
     path ? el('button', { textContent: 'All groups', onclick: () => go('') }) : el('b', {}, 'All groups'),
     ...parts.flatMap((p, i) => {
       const pre = parts.slice(0, i + 1).join('/');
-      return [' / ', pre !== path && kinds.get(pre) === 'groups' ? el('button', { textContent: p, onclick: () => go(pre) }) : el('b', {}, p)];
+      return [' / ', pre !== path ? el('button', { textContent: p, onclick: () => go(pre) }) : el('b', {}, p)];
     }),
     children.length ? ' → ' : '',
     ...children.sort(([a, x], [b, y]) => x.localeCompare(y) || a.localeCompare(b))
@@ -318,18 +346,18 @@ function nav(path, children) {
 }
 
 const load = run(async () => {
-  const path = $('scope').value.trim(), kind = kinds.get(path);
+  const path = $('scope').value.trim(), kind = await resolve(path);
   if (!kind) { // top level: every group whose parent you can't see
     localStorage.scope = cur = '';
     $('board').replaceChildren();
-    nav('', [...kinds].filter(([p, k]) => k === 'groups' && kinds.get(parentOf(p)) !== 'groups'));
+    nav('', GROUPS.length ? GROUPS.map(g => [g, 'groups']) : [...kinds].filter(([p, k]) => k === 'groups' && kinds.get(parentOf(p)) !== 'groups'));
     return setStatus(path ? `"${path}" isn't one of your groups or projects` : 'Pick a group');
   }
   localStorage.scope = path;
   cur = { kind, path, base: `/${kind}/${encodeURIComponent(path)}` };
   setStatus('Loading…');
   const [ms, issues, subgroups, projects] = await Promise.all([
-    all(cur.base + '/milestones?state=active&include_ancestors=true'),
+    all(`${cur.base}/milestones?state=active&${inherit}=true`),
     all(cur.base + '/issues?state=opened'),
     kind === 'groups' ? all(cur.base + '/subgroups') : [],
     kind === 'groups' ? all(cur.base + '/projects?archived=false&simple=true') : [],
@@ -373,10 +401,13 @@ $('signout').onclick = () => {
   try {
     if (!await token()) return login();
     setStatus('Loading groups and projects…');
-    const [groups, projects] = await Promise.all([
-      all('/groups?min_access_level=20'),
-      all('/projects?membership=true&simple=true&archived=false&min_access_level=20'),
+    const [{ version }, groups, projects] = await Promise.all([
+      api('/version').then(r => r.json()),
+      GROUPS.length ? GROUPS.map(full_path => ({ full_path })) : all('/groups?min_access_level=20'),
+      GROUPS.length ? [] : all('/projects?membership=true&simple=true&archived=false&min_access_level=20'),
     ]);
+    const [major, minor] = version.split('.').map(Number);
+    if (major < 16 || (major === 16 && minor < 7)) inherit = 'include_parent_milestones';
     groups.forEach(g => kinds.set(g.full_path, 'groups'));
     projects.forEach(p => kinds.set(p.path_with_namespace, 'projects'));
     fillList();
